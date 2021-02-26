@@ -51,10 +51,12 @@ AVAILABLE = (
     'BQToAppConversionAPI',
     'BQToCM',
     'BQToMeasurementProtocol',
+    'BQToMeasurementProtocolGA4',
     'BQToStorageExporter',
     'Commenter',
     'GAAudiencesUpdater',
     'GADataImporter',
+    'GAGoalsUpdater',
     'GAToBQImporter',
     'MLPredictor',
     'MLTrainer',
@@ -820,6 +822,134 @@ class GAAudiencesUpdater(BQWorker, GAWorker):
     self._get_diff()
     self._update_ga_audiences()
 
+    
+class GAGoalsUpdater(BQWorker, GAWorker):
+  """Worker to update GA goals using values from a BQ table.
+  See: https://developers.google.com/analytics/devguides/config/mgmt/v3/mgmtReference/management/goals#resource-representations
+  for more details on the required GA Goal JSON template format.
+  """
+
+  PARAMS = [
+      ('property_id', 'string', True, '',
+       'GA Property Tracking ID (e.g. UA-12345-3)'),
+      ('view_id', 'string', True, '', 'GA View ID (e.g. 345678)'),
+      ('bq_project_id', 'string', False, '', 'BQ Project ID'),
+      ('bq_dataset_id', 'string', True, '', 'BQ Dataset ID'),
+      ('bq_table_id', 'string', True, '', 'BQ Table ID'),
+      ('template', 'text', True, '', 'GA goal JSON template'),
+      ('account_id', 'string', False, '', 'GA Account ID'),
+  ]
+
+  def _infer_goals(self):
+    self._inferred_goals = {}
+    fields = [f.name for f in self._table.schema]
+    for row in self._table.fetch_data():
+      try:
+        template_rendered = self._params['template'] % (
+          dict(zip(fields, row)))
+        goal = json.loads(template_rendered)
+      except ValueError as e:
+        raise WorkerException(e)
+      self._inferred_goals[goal['name']] = goal
+
+  def _get_goals(self):
+    goals = []
+    start_index = 1
+    max_results = 100
+    total_results = 100
+    while start_index <= total_results:
+      request = self._ga_client.management().goals().list(
+          accountId=self._account_id,
+          webPropertyId=self._params['property_id'],
+          profileId=self._params['view_id'],
+          start_index=start_index,
+          max_results=max_results)
+      response = self.retry(request.execute)()
+      total_results = response['totalResults']
+      start_index += max_results
+      goals += response['items']
+    self._current_goals = {}
+    names = self._inferred_goals.keys()
+    for goal in goals:
+      if goal['name'] in names:
+        self._current_goals[goal['name']] = goal
+
+  def _equal(self, patch, goal):
+    """Checks whether applying a patch would not change a goal.
+    Args:
+        patch: An object that is going to be used as a patch
+            to update the goal.
+        goal: An object representing goal to be patched.
+    Returns:
+       True if applying the patch won't change the goal, False otherwise.
+    """
+    dicts = [(patch, goal)]
+    for d1, d2 in dicts:
+      keys = d1 if isinstance(d1, dict) else xrange(len(d1))
+      for k in keys:
+        try:
+          d2[k]
+        except (IndexError, KeyError):
+          return False
+        if isinstance(d1[k], dict):
+          if isinstance(d2[k], dict):
+            dicts.append((d1[k], d2[k]))
+          else:
+            return False
+        elif isinstance(d1[k], list):
+          if isinstance(d2[k], list) and len(d1[k]) == len(d2[k]):
+            dicts.append((d1[k], d2[k]))
+          else:
+            return False
+        elif d1[k] != d2[k]:
+          return False
+    return True
+
+  def _get_diff(self):
+    """Composes lists of goals to be created and updated in GA."""
+    self._goals_to_insert = []
+    self._goals_to_patch = {}
+    for name in self._inferred_goals:
+      inferred_goal = self._inferred_goals[name]
+      if name in self._current_goals:
+        current_goal = self._current_goals[name]
+        if not self._equal(inferred_goal, current_goal):
+          self._goals_to_patch[current_goal['id']] = inferred_goal
+      else:
+        self._goals_to_insert.append(inferred_goal)
+
+  def _update_ga_goals(self):
+    """Updates and/or creates goals in GA."""
+    for goal in self._goals_to_insert:
+      request = self._ga_client.management().goals().insert(
+          accountId=self._account_id,
+          webPropertyId=self._params['property_id'],
+          profileId=self._params['view_id'],
+          body=goal)
+      self.retry(request.execute)()
+    for goal_id in self._goals_to_patch:
+      goal = self._goals_to_patch[goal_id]
+      request = self._ga_client.management().goals().patch(
+          accountId=self._account_id,
+          webPropertyId=self._params['property_id'],
+          profileId=self._params['view_id'],
+          goalId=goal_id,
+          body=goal)
+      self.retry(request.execute)()
+
+  def _execute(self):
+    if self._params['account_id']:
+      self._account_id = self._params['account_id']
+    else:
+      self._account_id = self._parse_accountid_from_propertyid()
+    self._bq_setup()
+    self._table.reload()
+    self._ga_setup('v3')
+    self._infer_goals()
+    self._get_goals()
+    self._get_diff()
+    self._update_ga_goals()    
+
 
 class MLWorker(Worker):
   """Abstract ML Engine worker."""
@@ -994,6 +1124,125 @@ class MLVersionDeployer(MLWorker, StorageWorker):
 class MeasurementProtocolException(WorkerException):
   """Measurement Protocol execution exception."""
   pass
+
+
+class BQToMeasurementProtocolGA4(BQWorker):
+  """Worker to push data through Measurement Protocol."""
+
+  PARAMS = [
+      ('bq_project_id', 'string', False, '', 'BQ Project ID'),
+      ('bq_dataset_id', 'string', True, '', 'BQ Dataset ID'),
+      ('bq_table_id', 'string', True, '', 'BQ Table ID'),
+      ('measurement_id', 'string', True, '', 'Measurement ID'),
+      ('api_secret', 'string', True, '', 'API Secret'),
+      ('template', 'text', True, '', ('GA4 Measurement Protocol '
+                                      'JSON template')),
+      ('mp_batch_size', 'number', True, 20, ('Measurement Protocol '
+                                             'batch size')),
+      ('debug', 'boolean', True, False, 'Debug mode'),
+  ]
+
+  # BigQuery batch size for querying results. Default to 1000.
+  BQ_BATCH_SIZE = int(1e3)
+
+  # Maximum number of jobs to enqueued before spawning a new scheduler.
+  MAX_ENQUEUED_JOBS = 50
+
+  def _execute(self):
+    self._bq_setup()
+    self._table.reload()
+    page_token = self._params.get('bq_page_token', None)
+    batch_size = self.BQ_BATCH_SIZE
+    query_iterator = self.retry(self._table.fetch_data)(
+        max_results=batch_size,
+        page_token=page_token)
+
+    enqueued_jobs_count = 0
+    for query_page in query_iterator.pages:  # pylint: disable=unused-variable
+      # Enqueue job for this page
+      worker_params = self._params.copy()
+      worker_params['bq_page_token'] = page_token
+      worker_params['bq_batch_size'] = self.BQ_BATCH_SIZE
+      self._enqueue(
+        'BQToMeasurementProtocolProcessorGA4', worker_params, 0)
+      enqueued_jobs_count += 1
+
+      # Updates the page token reference for the next iteration.
+      page_token = query_iterator.next_page_token
+
+      # Spawns a new job to schedule the remaining pages.
+      if (enqueued_jobs_count >= self.MAX_ENQUEUED_JOBS
+          and page_token is not None):
+        worker_params = self._params.copy()
+        worker_params['bq_page_token'] = page_token
+        self._enqueue(self.__class__.__name__, worker_params, 0)
+        return
+
+
+class BQToMeasurementProtocolProcessorGA4(BQWorker):
+  """Worker pushing to Measurement Protocol for GA4 Properties."""
+
+  def _send_payload_list(self, payloads):
+    headers = {'content-type': 'application/json'}
+    for payload in payloads:
+      if self._debug:
+        domain = 'https://www.google-analytics.com/debug/mp/collect'
+        url = '{domain}?measurement_id={measurement_id}&api_secret={api_secret}'.format(
+          domain=domain, measurement_id=self._measurement_id,
+          api_secret=self._api_secret)
+        response = requests.post(
+          url,
+          data=json.dumps(payload),
+          headers=headers)
+        result = json.loads(response.text)
+        for msg in result['validationMessages']:
+          self.log_warn('Validation Message: %s, Payload: %s' % (
+            msg['description'], payload))
+      else:
+        domain = 'https://www.google-analytics.com/mp/collect'
+        url = '{domain}?measurement_id={measurement_id}&api_secret={api_secret}'.format(
+          domain=domain, measurement_id=self._measurement_id,
+          api_secret=self._api_secret)
+        response = requests.post(
+          url,
+          data=json.dumps(payload),
+          headers=headers)
+        if response.status_code != requests.codes.no_content:
+          raise MeasurementProtocolException(
+            'Failed to send event with status code (%s) and parameters: %s'
+            % (response.status_code, payload))
+
+  def _process_query_results(self, query_data, query_schema):
+    """Sends event hits from query data."""
+    fields = [f.name.encode('utf-8') for f in query_schema]
+    payload_list = []
+    for row in query_data:
+      utf8_row = []
+      for item in row:
+        utf8_row.append(str(item).encode('utf-8'))
+      template = self._params['template'] % dict(zip(fields, utf8_row))
+      measurement_protocol_payload = json.loads(template)
+      payload_list.append(measurement_protocol_payload)
+      if len(payload_list) >= self._params['mp_batch_size']:
+        self._send_payload_list(payload_list)
+        payload_list = []
+    if payload_list:
+      # Sends remaining payloads.
+      self._send_payload_list(payload_list)
+
+  def _execute(self):
+    self._bq_setup()
+    self._table.reload()
+    self._debug = self._params['debug']
+    self._measurement_id = self._params['measurement_id']
+    self._api_secret = self._params['api_secret']
+    page_token = self._params['bq_page_token'] or None
+    batch_size = self._params['bq_batch_size']
+    query_iterator = self.retry(self._table.fetch_data)(
+        max_results=batch_size,
+        page_token=page_token)
+    query_first_page = next(query_iterator.pages)
+    self._process_query_results(query_first_page, query_iterator.schema)
 
 
 class BQToMeasurementProtocol(BQWorker):
